@@ -1,0 +1,33 @@
+# 本地环境、工作记录和运行文件
+/.venv/
+/venv/
+/docs/
+/work/
+/tests/
+/test_fail.log
+
+# 前端依赖与可重建的网页资源
+/web/node_modules/
+/code_browser/static/
+/web/.vite/
+/web/dist/
+
+# Python缓存、测试输出和构建文件
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+/build/
+/dist/
+*.egg-info/
+playwright-report/
+test-results/
+npm-debug.log*
+
+# 操作系统生成文件
+.DS_Store
+Thumbs.db
