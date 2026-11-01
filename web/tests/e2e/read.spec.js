@@ -1774,3 +1774,259 @@ async function reverseSourceAndInputSelections({page}) {
 }
 
 test("语言切换保留屏外反向源码选区和输入框选择", reverseSourceAndInputSelections);
+
+/**
+ * 通过真实界面阅读合法深表达式，核对源码、数据接口、调用和对象定义均保留。
+ * Args:
+ *   context (object): Playwright 提供的真实浏览器页面。
+ * Returns:
+ *   Promise<void>: 完整阅读满足源码事实，且目标模块没有执行后完成。
+ */
+async function deepExpressionReading({page}) {
+  const runtime = path.join(projectRoot, "work", "runtime", "e2e-targets");
+  await fs.mkdir(runtime, {recursive: true});
+  const target = await fs.mkdtemp(path.join(runtime, "deep-expression-"));
+  const marker = path.join(target, "TOP_LEVEL_EXECUTED.txt");
+  const assignmentTerms = ["normalize(value)"];
+  const returnTerms = ["worker.finish(total)"];
+  // 无括号的左结合加法形成合法深语法树，避免把解析器不接受的括号嵌套当作用例。
+  for (let index = 1; index < 720; index += 1) {
+    assignmentTerms.push(String(index % 9 + 1));
+    returnTerms.push("extra");
+  }
+  const assignmentExpression = assignmentTerms.join(" + ");
+  const returnExpression = returnTerms.join(" + ");
+  const sources = {
+    "main.py": [
+      '"""深表达式阅读入口，组合普通函数和工作对象。"""',
+      "from pathlib import Path", "from operations import Worker, deep_total, normalize", "",
+      'Path(__file__).with_name("TOP_LEVEL_EXECUTED.txt").write_text("main executed", encoding="utf-8")', "",
+      "def main(value: int = 1) -> int:",
+      '    """组织跨文件计算。',
+      "    Args:", "        value (int): 传入的整数。",
+      "    Returns:", "        int: 工作对象处理的结果。", '    """',
+      "    seed = normalize(value)", "    worker = Worker(offset=3)",
+      "    return worker.finish(deep_total(seed, extra=2))", "",
+    ].join("\n"),
+    "operations.py": [
+      '"""提供普通函数、自定义对象和合法长加法表达式。"""',
+      "from pathlib import Path", "",
+      'Path(__file__).with_name("TOP_LEVEL_EXECUTED.txt").write_text("operations executed", encoding="utf-8")', "",
+      "def normalize(value: int) -> int:",
+      '    """把输入交给后续计算。',
+      "    Args:", "        value (int): 原始整数。",
+      "    Returns:", "        int: 增加一后的整数。", '    """',
+      "    return value + 1", "",
+      "class Worker:",
+      '    """表示持有偏移量并提供整理方法的工作对象。"""', "",
+      "    def __init__(self, offset: int = 0):",
+      '        """记录工作对象的偏移量。',
+      "        Args:", "            offset (int): 最终结果的附加偏移量。",
+      "        Returns:", "            None: 完成对象初始化。", '        """',
+      "        # offset 保存该对象处理结果时附加的偏移量。",
+      "        self.offset = offset", "",
+      "    def finish(self, value: int) -> int:",
+      '        """整理整数并加上对象偏移量。',
+      "        Args:", "            value (int): 待整理的整数。",
+      "        Returns:", "            int: 整理后叠加偏移量的结果。", '        """',
+      "        return normalize(value) + self.offset", "",
+      "def deep_total(value: int, extra: int = 2) -> int:",
+      '    """保留长表达式中的调用、参数和完整返回原文。',
+      "    Args:", "        value (int): 传入普通函数的整数。",
+      "        extra (int): 返回表达式每一项使用的附加量。",
+      "    Returns:", "        int: 深表达式的静态返回结果。", '    """',
+      "    total = " + assignmentExpression,
+      "    worker = Worker(offset=extra)",
+      "    if total > 0:", "        return " + returnExpression,
+      "    return value", "",
+    ].join("\n"),
+  };
+  for (const [name, source] of Object.entries(sources)) {
+    await fs.writeFile(path.join(target, name), source, "utf8");
+  }
+  expect(assignmentTerms).toHaveLength(720);
+  expect(returnTerms).toHaveLength(720);
+  await expect(fs.access(marker)).rejects.toMatchObject({code: "ENOENT"});
+  const audit = await offlineAudit(page);
+
+  /**
+   * 读取真实绘图关系，以原始名称和文件定位跨函数调用。
+   * Args:
+   *   无。
+   * Returns:
+   *   object: 已加载的真实调用端点及调用位置标识。
+   */
+  function inspectDeepGraph() {
+    const cy = document.querySelector("#graph")._cyreg.cy;
+    const edges = [];
+    for (const edge of cy.edges()) {
+      const source = edge.source().data(), targetNode = edge.target().data();
+      edges.push({source: source.id, target: targetNode.id,
+        from: source.name, fromFile: source.relative_path?.replaceAll("\\", "/"),
+        to: targetNode.name, toFile: targetNode.relative_path?.replaceAll("\\", "/"),
+        callIds: edge.data("call_ids") || []});
+    }
+    return {edges};
+  }
+
+  /**
+   * 取得真实函数行或调用曲线在当前画布内的可点击位置。
+   * Args:
+   *   spec (object): 真实定义名称、文件以及可选目标定义名称。
+   * Returns:
+   *   object: 原生绘图库计算的像素位置。
+   */
+  function deepCanvasPoint(spec) {
+    const cy = document.querySelector("#graph")._cyreg.cy;
+    let source = null, targetNode = null;
+    for (const node of cy.nodes()) {
+      if (node.data("is_container")) continue;
+      const file = (node.data("relative_path") || "").replaceAll("\\", "/");
+      if (node.data("name") === spec.name && file === spec.file) source = node;
+      if (node.data("name") === spec.targetName && file === spec.targetFile) targetNode = node;
+    }
+    if (!source || (spec.targetName && !targetNode)) throw new Error("深表达式用例的真实调用端点尚未显示。");
+    if (spec.targetName) {
+      for (const edge of cy.edges()) {
+        if (edge.source().id() === source.id() && edge.target().id() === targetNode.id()) return edge.renderedMidpoint();
+      }
+      throw new Error("深表达式用例没有找到预期的真实调用连线。");
+    }
+    return source.renderedPosition();
+  }
+
+  /**
+   * 用实际鼠标选择图中的真实定义或调用边，不派发应用内部事件。
+   * Args:
+   *   spec (object): 需要点击的定义或关系身份。
+   * Returns:
+   *   Promise<void>: 完成真实画布点击。
+   */
+  async function clickDeepCanvas(spec) {
+    const point = await page.evaluate(deepCanvasPoint, spec);
+    const box = await page.locator("#graph").boundingBox();
+    expect(point.x).toBeGreaterThanOrEqual(0);
+    expect(point.y).toBeGreaterThanOrEqual(0);
+    expect(point.x).toBeLessThanOrEqual(box.width);
+    expect(point.y).toBeLessThanOrEqual(box.height);
+    await page.mouse.click(box.x + point.x, box.y + point.y);
+  }
+
+  // 从真实表单直到 ready；先阅读入口的原文和数据接口，再进入跨文件调用图。
+  await page.goto("/");
+  await analyzeProject(page, target);
+  await openFile(page, "main.py");
+  await expect(page.locator("#details")).toContainText("深表达式阅读入口，组合普通函数和工作对象。");
+  expect((await page.evaluate(sourceSelectionContext)).source).toBe(sources["main.py"]);
+  await page.locator("#details .entity-row").getByRole("button", {name: "main", exact: true}).click();
+  await expect(page.locator("#details h2")).toHaveText("main");
+  await expect(page.locator("#details .parameter-row")).toContainText("value");
+  /**
+   * 等待本次深度调整的真实调用图响应，防止读取上一范围的相同端点。
+   * Args:
+   *   response (Response): 页面收到的本地服务响应。
+   * Returns:
+   *   boolean: 是否为本次二层调用图查询。
+   */
+  function isDepthTwoGraphResponse(response) {
+    const address = new URL(response.url());
+    return address.pathname === "/api/graph" && address.searchParams.get("kind") === "call" &&
+      address.searchParams.get("depth") === "2";
+  }
+  const graphResponse = page.waitForResponse(isDepthTwoGraphResponse);
+  await page.locator("#graph-depth").fill("2");
+  await page.locator("#graph-depth").press("Tab");
+  await (await graphResponse).finished();
+  await page.evaluate(waitReadingFrames);
+  await expect.poll(page.evaluate.bind(page, inspectDeepGraph)).toMatchObject({edges: expect.arrayContaining([
+    expect.objectContaining({from: "main", fromFile: "main.py", to: "normalize", toFile: "operations.py"}),
+    expect.objectContaining({from: "main", fromFile: "main.py", to: "deep_total", toFile: "operations.py"}),
+    expect.objectContaining({from: "main", fromFile: "main.py", to: "Worker", toFile: "operations.py"}),
+    expect.objectContaining({from: "main", fromFile: "main.py", to: "finish", toFile: "operations.py"}),
+    expect.objectContaining({from: "deep_total", fromFile: "operations.py", to: "normalize", toFile: "operations.py"}),
+    expect.objectContaining({from: "deep_total", fromFile: "operations.py", to: "finish", toFile: "operations.py"}),
+  ])});
+  for (const edge of (await page.evaluate(inspectDeepGraph)).edges) {
+    expect(edge.source.startsWith("container:")).toBe(false);
+    expect(edge.target.startsWith("container:")).toBe(false);
+    expect(edge.callIds.length).toBeGreaterThan(0);
+  }
+  await page.locator("#zoom-fit").click();
+  await clickDeepCanvas({name: "deep_total", file: "operations.py"});
+  await expect(page.locator("#details h2")).toHaveText("deep_total");
+  await expect(page.getByTestId("source-path")).toContainText("operations.py");
+  await expect(page.locator("#details .parameter-row")).toContainText(["value", "extra"]);
+  await expect(page.locator("#details .parameter-row").filter({hasText: "extra"})).toContainText("= 2");
+  expect((await page.evaluate(sourceSelectionContext)).source).toBe(sources["operations.py"]);
+
+  // 完整返回文本与选区分别对照独立原文，不能只验证长表达式前缀或函数返回了记录。
+  const returnButton = page.locator('#details details[data-section-key="section.io"]')
+    .getByRole("button", {name: "返回 · " + returnExpression, exact: true});
+  await expect(returnButton).toHaveText("返回 · " + returnExpression);
+  await returnButton.click();
+  const statement = "return " + returnExpression;
+  const returnStart = sources["operations.py"].indexOf(statement);
+  expect(returnStart).toBeGreaterThan(0);
+  await expect.poll(page.evaluate.bind(page, sourceSelectionContext)).toMatchObject({
+    model: {anchor: returnStart, head: returnStart + statement.length},
+  });
+  const selectedReturn = await page.evaluate(sourceSelectionContext);
+  expect(selectedReturn.model).toEqual({anchor: returnStart, head: returnStart + statement.length});
+  expect(selectedReturn.source.slice(selectedReturn.model.anchor, selectedReturn.model.head)).toBe(statement);
+
+  // 从真实曲线进入调用实参和普通函数定义，深树最左端的调用不能遗漏。
+  await clickDeepCanvas({name: "deep_total", file: "operations.py", targetName: "normalize", targetFile: "operations.py"});
+  await expect(page.locator("#details h2")).toHaveText("调用位置");
+  await page.locator("#details .call-row").getByRole("button", {name: "normalize(value)", exact: true}).click();
+  await expect(page.locator("#details h2")).toHaveText("normalize");
+  await expect(page.locator("#details .argument-row .code-button")).toHaveText("value");
+  await expect(page.locator('#details details[data-section-key="section.arguments"]')).toContainText("签名参数：value");
+  await page.locator("#details .target-link").filter({hasText: /normalize$/}).click();
+  await expect(page.locator("#details h2")).toHaveText("normalize");
+  await expect(page.locator('#details details[data-section-key="section.io"] .code-button')).toHaveText("返回 · value + 1");
+
+  // 展开深函数内部条件并通过表达式中的方法调用继续阅读真实对象方法。
+  await clickDeepCanvas({name: "deep_total", file: "operations.py"});
+  await expect(page.locator("#details h2")).toHaveText("deep_total");
+  await page.locator("#details").getByRole("button", {name: "查看内部逻辑", exact: true}).click();
+  await page.getByRole("button", {name: "全部展开", exact: true}).click();
+  await expect(page.getByTestId("logic-view")).toContainText("if total > 0");
+  await expect(page.getByTestId("logic-view").locator(".kind-return .logic-label").first()).toHaveText(statement);
+  await page.getByTestId("logic-view").getByRole("button", {name: "worker.finish(total)", exact: true}).click();
+  await expect(page.locator("#details h2")).toHaveText("worker.finish");
+  await expect(page.locator("#details .argument-row .code-button")).toHaveText("total");
+  await page.locator("#details .target-link").filter({hasText: /Worker\.finish$/}).click();
+  await expect(page.locator("#details h2")).toHaveText("Worker.finish");
+  await expect(page.locator("#details")).toContainText("整理整数并加上对象偏移量。");
+  await expect(page.locator('#details details[data-section-key="section.io"] .code-button')).toHaveText("返回 · normalize(value) + self.offset");
+  await page.locator("#history-back").click();
+  await expect(page.locator("#details h2")).toHaveText("worker.finish");
+  await page.locator("#history-back").click();
+  await expect(page.locator("#details h2")).toHaveText("deep_total");
+  await expect(page.getByTestId("logic-view")).toBeVisible();
+
+  // 由深函数内部创建的变量定位真实类定义，既检查数据形态也检查跨定义导航。
+  const worker = page.locator('#details details[data-section-key="section.objects"] .entity-row').filter({
+    has: page.getByRole("button", {name: "worker", exact: true}),
+  });
+  await worker.locator("xpath=following-sibling::div[contains(@class,'object-actions')][1]")
+    .getByRole("button", {name: "查看所属类 / 定义", exact: true}).click();
+  await expect(page.locator("#details h2")).toHaveText("所属类 / 最终定义");
+  await page.locator("#details .target-link").filter({hasText: /Worker$/}).click();
+  await expect(page.locator("#details h2")).toHaveText("Worker");
+  await expect(page.locator("#details")).toContainText("表示持有偏移量并提供整理方法的工作对象。");
+  await expect(page.locator("#details .entity-row").getByRole("button", {name: "finish", exact: true})).toBeVisible();
+  expect((await page.evaluate(sourceSelectionContext)).source).toBe(sources["operations.py"]);
+  for (const [name, source] of Object.entries(sources)) expect(await fs.readFile(path.join(target, name), "utf8")).toBe(source);
+  await expect(fs.access(marker)).rejects.toMatchObject({code: "ENOENT"});
+  expect((await fs.readdir(target)).sort()).toEqual(["main.py", "operations.py"]);
+  expect(audit.external).toEqual([]);
+  expect(audit.errors).toEqual([]);
+
+  // 仅在整条真实阅读验收成功后清理本用例目录，保留失败现场供定位。
+  const resolved = path.resolve(target);
+  if (!resolved.startsWith(path.resolve(runtime) + path.sep)) throw new Error("深表达式临时目录超出验收工作区，拒绝清理。");
+  await fs.rm(resolved, {recursive: true});
+}
+
+test("合法深表达式完成源码、调用、逻辑和对象定义真实阅读", deepExpressionReading);

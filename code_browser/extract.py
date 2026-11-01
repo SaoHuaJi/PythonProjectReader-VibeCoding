@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import tokenize
+from collections.abc import Iterator
 
 from .logic import build_logic, logic_id
 from .models import entity_record, make_id
@@ -66,7 +67,7 @@ class Extractor:
         self.scopes.append(module["id"])
         self._prepare_scope(module["id"], tree.body)
         self.bodies[module["id"]] = tree.body
-        self._block(tree.body)
+        self._drive(self._block(tree.body))
         self.scopes.pop()
         calls_by_owner: dict[str, dict] = {}
         for call in self.snapshot["calls"].values():
@@ -96,6 +97,25 @@ class Extractor:
         ]
         module["comments"] = self.file["comments"]
         self._entrypoints(tree)
+
+    def _drive(self, task: Iterator[Iterator]) -> None:
+        """用显式任务栈完成全部子遍历，避免语法深度占用函数调用栈。
+
+        Args:
+            task (Iterator[Iterator]): 模块区块生成的首个遍历任务。
+
+        Returns:
+            None: 按原顺序完成所有子任务及其进入、退出处理。
+        """
+        # 父任务暂停在交出子任务的位置，子任务完成后继续执行其退出动作。
+        pending = [task]
+        while pending:
+            try:
+                child = next(pending[-1])
+            except StopIteration:
+                pending.pop()
+            else:
+                pending.append(child)
 
     def _declarations(self, body: list[ast.AST]) -> tuple[set, set]:
         """收集当前作用域的 global 和 nonlocal 声明。
@@ -315,7 +335,7 @@ class Extractor:
         context: str | None = None,
         message_code: str = "",
         params: dict | None = None,
-    ) -> None:
+    ) -> Iterator[Iterator]:
         """在可选逻辑上下文中遍历一个语句区块。
 
         Args:
@@ -325,7 +345,7 @@ class Extractor:
             params (dict | None): 保留原文的模板参数。
 
         Returns:
-            None: 收集当前区块源码事实。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         if context:
             self.contexts.append(context)
@@ -336,47 +356,47 @@ class Extractor:
                 }
             )
         for node in body:
-            self._walk(node)
+            yield self._walk(node)
         if context:
             self.contexts.pop()
             self.context_messages.pop()
 
-    def _walk(self, node: ast.AST | None) -> None:
+    def _walk(self, node: ast.AST | None) -> Iterator[Iterator]:
         """维护当前语句位置后分派语法结构。
 
         Args:
             node (ast.AST | None): 待遍历的节点。
 
         Returns:
-            None: 更新当前源码记录。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         if node is None:
             return
         is_statement = isinstance(node, ast.stmt)
         if is_statement:
             self.statements.append(node)
-        self._walk_node(node)
+        yield self._walk_node(node)
         if is_statement:
             self.statements.pop()
 
-    def _walk_node(self, node: ast.AST) -> None:
+    def _walk_node(self, node: ast.AST) -> Iterator[Iterator]:
         """按语法种类提取定义和引用，并处理作用域边界。
 
         Args:
             node (ast.AST): 当前语法节点。
 
         Returns:
-            None: 将当前节点及必要子节点加入源码索引。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         # 定义体必须切换作用域；默认值与装饰器属于外层定义过程。
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            self._function(node)
+            yield self._function(node)
             return
         if isinstance(node, ast.ClassDef):
-            self._class(node)
+            yield self._class(node)
             return
         if isinstance(node, ast.Lambda):
-            self._lambda(node)
+            yield self._lambda(node)
             return
 
         # 赋值只记录原文绑定，不求解容器拆包或对象运行值。
@@ -384,19 +404,19 @@ class Extractor:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             annotation = getattr(node, "annotation", None)
             for target in targets:
-                self._binding(
+                yield self._binding(
                     target,
                     self.source.slice(getattr(node, "value", None)),
                     self.source.slice(annotation),
                     type(node).__name__,
                 )
-                self._walk(target)
-            self._annotation(annotation)
-            self._walk(getattr(node, "value", None))
+                yield self._walk(target)
+            yield self._annotation(annotation)
+            yield self._walk(getattr(node, "value", None))
             return
         if isinstance(node, ast.NamedExpr):
-            self._binding(node.target, self.source.slice(node.value))
-            self._walk(node.value)
+            yield self._binding(node.target, self.source.slice(node.value))
+            yield self._walk(node.value)
             return
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             self._import(node)
@@ -404,54 +424,56 @@ class Extractor:
 
         # 条件与各子块保持独立的调用上下文。
         if isinstance(node, ast.If):
-            self._expression(node.test, "条件判断", "context.condition")
-            self._block(node.body, "if 条件成立", "context.if_true")
-            self._block(node.orelse, "else 分支", "context.else")
+            yield self._expression(node.test, "条件判断", "context.condition")
+            yield self._block(node.body, "if 条件成立", "context.if_true")
+            yield self._block(node.orelse, "else 分支", "context.else")
             return
         if isinstance(node, (ast.For, ast.AsyncFor)):
-            self._binding(node.target, self.source.slice(node.iter), "", "for")
-            self._expression(node.iter, "循环迭代对象", "context.iterable")
-            self._block(node.body, "循环体", "context.loop")
-            self._block(node.orelse, "循环自然结束 else", "context.loop_else")
+            yield self._binding(node.target, self.source.slice(node.iter), "", "for")
+            yield self._expression(node.iter, "循环迭代对象", "context.iterable")
+            yield self._block(node.body, "循环体", "context.loop")
+            yield self._block(node.orelse, "循环自然结束 else", "context.loop_else")
             return
         if isinstance(node, ast.While):
-            self._expression(node.test, "循环条件", "context.loop_condition")
-            self._block(node.body, "循环体", "context.loop")
-            self._block(node.orelse, "循环自然结束 else", "context.loop_else")
+            yield self._expression(node.test, "循环条件", "context.loop_condition")
+            yield self._block(node.body, "循环体", "context.loop")
+            yield self._block(node.orelse, "循环自然结束 else", "context.loop_else")
             return
         if isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
-                self._expression(
+                yield self._expression(
                     item.context_expr, "上下文表达式", "context.with_expression"
                 )
                 if item.optional_vars is not None:
-                    self._binding(
+                    yield self._binding(
                         item.optional_vars,
                         self.source.slice(item.context_expr),
                         "",
                         "with",
                     )
-            self._block(node.body, "上下文主体", "context.with_body")
+            yield self._block(node.body, "上下文主体", "context.with_body")
             return
         if isinstance(node, (ast.Try, ast.TryStar)):
-            self._block(node.body, "try 主体", "context.try")
+            yield self._block(node.body, "try 主体", "context.try")
             for handler in node.handlers:
-                self._expression(
+                yield self._expression(
                     handler.type, "异常类型表达式", "context.exception_type"
                 )
                 if handler.name:
                     self._named_binding(handler.name, handler, "", "", "except")
-                self._block(
+                yield self._block(
                     handler.body,
                     "except " + self.source.slice(handler.type),
                     "context.except",
                     {"type": self.source.slice(handler.type)},
                 )
-            self._block(node.orelse, "try else（主体正常完成）", "context.try_else")
-            self._block(node.finalbody, "finally", "context.finally")
+            yield self._block(
+                node.orelse, "try else（主体正常完成）", "context.try_else"
+            )
+            yield self._block(node.finalbody, "finally", "context.finally")
             return
         if isinstance(node, ast.Match):
-            self._expression(node.subject, "match 表达式", "context.match")
+            yield self._expression(node.subject, "match 表达式", "context.match")
             for case in node.cases:
                 self.contexts.append("case " + self.source.slice(case.pattern))
                 self.context_messages.append(
@@ -460,9 +482,9 @@ class Extractor:
                         "params": {"pattern": self.source.slice(case.pattern)},
                     }
                 )
-                self._walk(case.pattern)
-                self._expression(case.guard, "case 附加条件", "context.guard")
-                self._block(case.body)
+                yield self._walk(case.pattern)
+                yield self._expression(case.guard, "case 附加条件", "context.guard")
+                yield self._block(case.body)
                 self.contexts.pop()
                 self.context_messages.pop()
             return
@@ -471,7 +493,7 @@ class Extractor:
         if isinstance(node, ast.BoolOp):
             name = "and" if isinstance(node.op, ast.And) else "or"
             for value in node.values:
-                self._expression(
+                yield self._expression(
                     value,
                     f"短路表达式 {name}（有条件求值）",
                     "context.short_circuit",
@@ -479,11 +501,13 @@ class Extractor:
                 )
             return
         if isinstance(node, ast.IfExp):
-            self._expression(node.test, "条件表达式判断", "context.conditional_test")
-            self._expression(
+            yield self._expression(
+                node.test, "条件表达式判断", "context.conditional_test"
+            )
+            yield self._expression(
                 node.body, "条件表达式成立分支", "context.conditional_true"
             )
-            self._expression(
+            yield self._expression(
                 node.orelse, "条件表达式否则分支", "context.conditional_false"
             )
             return
@@ -507,7 +531,7 @@ class Extractor:
                 }
             )
             for child in ast.iter_child_nodes(node):
-                self._walk(child)
+                yield self._walk(child)
             self.contexts.pop()
             self.context_messages.pop()
             return
@@ -538,7 +562,7 @@ class Extractor:
         elif isinstance(node, ast.MatchMapping) and node.rest:
             self._named_binding(node.rest, node, "", "", "match")
         for child in ast.iter_child_nodes(node):
-            self._walk(child)
+            yield self._walk(child)
 
     def _expression(
         self,
@@ -546,7 +570,7 @@ class Extractor:
         context: str,
         message_code: str,
         params: dict | None = None,
-    ) -> None:
+    ) -> Iterator[Iterator]:
         """在明确表达式语义中收集引用和调用。
 
         Args:
@@ -556,7 +580,7 @@ class Extractor:
             params (dict | None): 源码名称或表达式参数。
 
         Returns:
-            None: 收集当前表达式事实。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         self.contexts.append(context)
         self.context_messages.append(
@@ -565,31 +589,33 @@ class Extractor:
                 "params": params or {},
             }
         )
-        self._walk(node)
+        yield self._walk(node)
         self.contexts.pop()
         self.context_messages.pop()
 
-    def _annotation(self, node: ast.AST | None) -> None:
+    def _annotation(self, node: ast.AST | None) -> Iterator[Iterator]:
         """只记录类型注解引用，不把其中表达式混作函数体调用。
 
         Args:
             node (ast.AST | None): 类型注解表达式。
 
         Returns:
-            None: 增加注解引用记录。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         self.annotation_depth += 1
-        self._expression(node, "类型注解", "context.annotation")
+        yield self._expression(node, "类型注解", "context.annotation")
         self.annotation_depth -= 1
 
-    def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+    def _function(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> Iterator[Iterator]:
         """读取函数定义、参数和独立函数体。
 
         Args:
             node (ast.FunctionDef | ast.AsyncFunctionDef): 函数定义节点。
 
         Returns:
-            None: 记录函数实体及属于它的源码事实。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         parent = self.snapshot["entities"][self.scopes[-1]]
         kind = "method" if parent["kind"] == "class" else "function"
@@ -605,9 +631,13 @@ class Extractor:
             }
         )
         for decorator in node.decorator_list:
-            self._expression(decorator, "装饰器表达式（定义时）", "context.decorator")
+            yield self._expression(
+                decorator, "装饰器表达式（定义时）", "context.decorator"
+            )
         for default in [*node.args.defaults, *node.args.kw_defaults]:
-            self._expression(default, "默认参数表达式（定义时）", "context.default")
+            yield self._expression(
+                default, "默认参数表达式（定义时）", "context.default"
+            )
         for arg in [
             *node.args.posonlyargs,
             *node.args.args,
@@ -615,10 +645,10 @@ class Extractor:
             *([node.args.vararg] if node.args.vararg else []),
             *([node.args.kwarg] if node.args.kwarg else []),
         ]:
-            self._annotation(arg.annotation)
-        self._annotation(node.returns)
+            yield self._annotation(arg.annotation)
+        yield self._annotation(node.returns)
         for type_param in getattr(node, "type_params", []):
-            self._annotation(type_param)
+            yield self._annotation(type_param)
 
         self.scopes.append(entity["id"])
         self._prepare_scope(entity["id"], node.body, getattr(node, "args", None))
@@ -628,7 +658,7 @@ class Extractor:
         previous_messages = self.context_messages
         self.contexts = ["函数体"]
         self.context_messages = [{"message_code": "context.function", "params": {}}]
-        self._block(node.body)
+        yield self._block(node.body)
         self.contexts = previous_contexts
         self.context_messages = previous_messages
         self.scopes.pop()
@@ -677,14 +707,14 @@ class Extractor:
                 }
             )
 
-    def _class(self, node: ast.ClassDef) -> None:
+    def _class(self, node: ast.ClassDef) -> Iterator[Iterator]:
         """读取类说明、基类和类体独立作用域。
 
         Args:
             node (ast.ClassDef): 类定义语法结构。
 
         Returns:
-            None: 增加类及其属性、方法和类体调用。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         entity = self._entity("class", node.name, node)
         entity.update(
@@ -697,11 +727,13 @@ class Extractor:
             }
         )
         for item in [*node.bases, *node.decorator_list]:
-            self._expression(item, "类定义表达式", "context.class_definition")
+            yield self._expression(item, "类定义表达式", "context.class_definition")
         for item in node.keywords:
-            self._expression(item.value, "类定义关键字表达式", "context.class_keyword")
+            yield self._expression(
+                item.value, "类定义关键字表达式", "context.class_keyword"
+            )
         for type_param in getattr(node, "type_params", []):
-            self._annotation(type_param)
+            yield self._annotation(type_param)
         self.scopes.append(entity["id"])
         self._prepare_scope(entity["id"], node.body, getattr(node, "args", None))
         self.bodies[entity["id"]] = node.body
@@ -709,25 +741,25 @@ class Extractor:
         previous_messages = self.context_messages
         self.contexts = ["类体初始化"]
         self.context_messages = [{"message_code": "context.class", "params": {}}]
-        self._block(node.body)
+        yield self._block(node.body)
         self.contexts = previous_contexts
         self.context_messages = previous_messages
         self.scopes.pop()
 
-    def _lambda(self, node: ast.Lambda) -> None:
+    def _lambda(self, node: ast.Lambda) -> Iterator[Iterator]:
         """为匿名函数建立独立参数和表达式作用域。
 
         Args:
             node (ast.Lambda): 匿名函数表达式。
 
         Returns:
-            None: 增加匿名函数实体，避免其内部调用误归属。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         name = f"<lambda@{node.lineno}>"
         entity = self._entity("lambda", name, node)
         entity["signature"] = self.source.slice(node).split(":", 1)[0] + ":"
         for default in [*node.args.defaults, *node.args.kw_defaults]:
-            self._expression(
+            yield self._expression(
                 default, "匿名函数默认参数（定义时）", "context.lambda_default"
             )
         self.scopes.append(entity["id"])
@@ -739,7 +771,7 @@ class Extractor:
         previous_messages = self.context_messages
         self.contexts = ["匿名函数体"]
         self.context_messages = [{"message_code": "context.lambda", "params": {}}]
-        self._walk(node.body)
+        yield self._walk(node.body)
         entity["returns"].append(
             {
                 "expression": self.source.slice(node.body),
@@ -758,7 +790,7 @@ class Extractor:
         value: str,
         annotation: str = "",
         assignment_kind: str = "assignment",
-    ) -> None:
+    ) -> Iterator[Iterator]:
         """记录赋值目标，不推测右侧实际运行值。
 
         Args:
@@ -768,7 +800,7 @@ class Extractor:
             assignment_kind (str): 赋值、循环或上下文绑定的种类。
 
         Returns:
-            None: 记录每个可定位绑定。
+            Iterator[Iterator]: 按序执行的子遍历任务，由统一循环驱动恢复并完成当前处理。
         """
         if isinstance(target, ast.Name):
             self._named_binding(target.id, target, value, annotation, assignment_kind)
@@ -796,9 +828,9 @@ class Extractor:
                 owner["locals"].append(entity["id"])
         elif isinstance(target, (ast.Tuple, ast.List)):
             for item in target.elts:
-                self._binding(item, value, annotation, assignment_kind)
+                yield self._binding(item, value, annotation, assignment_kind)
         elif isinstance(target, ast.Starred):
-            self._binding(target.value, value, annotation, assignment_kind)
+            yield self._binding(target.value, value, annotation, assignment_kind)
 
     def _named_binding(
         self,

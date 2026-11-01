@@ -152,12 +152,33 @@ By default, the tool prefers port 8778 and selects an available port if it is oc
 
 ## Analysis Settings
 
-- **Source roots**: determine source ownership and explicitly include additional scan directories. Ordinary layouts use the project root; `src` layouts can be detected automatically or adjusted manually.
+- **Source roots**: determine source ownership and explicitly include additional scan directories. Ordinary layouts use the project root; `src` layouts can be detected automatically or adjusted manually. They are not a scan allowlist: Python files under the project root remain included unless excluded.
 - **Package directories**: selecting a regular package containing `__init__.py` preserves its full package name. Automatically inferred parent import search directories do not expand the scan scope.
 - **Namespace packages**: are interpreted relative to explicit source roots, without guessing directory prefixes.
 - **Dependency source and type stubs**: add read-only lookup directories without installing or running target dependencies.
-- **Excluded directories**: virtual environments, caches, and build directories are excluded by default; `tests` is not excluded by default.
+- **Excluded directories**: virtual environments, caches, and build directories are excluded by default; `tests` is not. The target project's `.gitignore` is not read automatically. A custom list **replaces all default rules**: retain the defaults you need before adding dependency copies, historical snapshots, or temporary directories. Rules match directory names at any depth or directory paths relative to the project root, support wildcards, and use `/` as the path separator. For example, `tmp` excludes directories with that name at any depth, while `research/history` excludes that relative path. Keep the business and algorithm implementation source actually used by your project.
 - **Query timeout**: controls the wait for definition and symbol-reference queries, in seconds.
+
+Default exclusion list:
+
+```text
+.git
+.hg
+.svn
+.venv
+venv
+env
+__pycache__
+node_modules
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+.uv-cache
+build
+dist
+htmlcov
+```
 
 ## Analysis Boundaries
 
